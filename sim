@@ -16,7 +16,7 @@ import os
 # =========================
 # 1) CONFIG
 # =========================
-API_KEY = "AIzaSyBviNwbX4Ktsi6_6wVOIYc9K1mcLHIfWS8"  # <-- put your key here
+API_KEY = ""  # <-- put your key here
 
 # DMS coordinates
 LAUNCH_DMS       = ("34°13'31.1\"N", "77°46'22.9\"W")
