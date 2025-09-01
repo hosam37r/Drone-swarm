@@ -1,0 +1,325 @@
+# droneswarm/droneflight.py
+# Google satellite overlay + per-drone dashed plots (Truth vs Spoofed), 10 drones
+# pip install pillow numpy matplotlib
+
+import math
+import io
+import urllib.parse
+import urllib.request
+from typing import List, Tuple
+import numpy as np
+from PIL import Image, ImageDraw
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import os
+
+# =========================
+# 1) CONFIG
+# =========================
+API_KEY = "AIzaSyBviNwbX4Ktsi6_6wVOIYc9K1mcLHIfWS8"  # <-- put your key here
+
+# DMS coordinates
+LAUNCH_DMS       = ("34°13'31.1\"N", "77°46'22.9\"W")
+TRUTH_TARGET_DMS = ("34°13'33.7\"N", "77°52'18.8\"W")
+DRIFT_TARGET_DMS = ("34°13'28.7\"N", "77°52'18.2\"W")
+
+# Formation & rendering
+N_DRONES       = 10
+DRONE_SPREAD_M = 80.0   # total N-S spread (meters)
+N_STEPS        = 300    # samples per trajectory
+
+# Satellite overlay image
+IMG_SIZE = (1280, 1024)  # final PNG size (WxH)
+MAPTYPE  = "satellite"   # 'satellite' | 'hybrid' | 'roadmap' | 'terrain'
+STATIC_SCALE = 2         # 1 or 2 (Google Static Maps)
+
+# Matplotlib styling
+LINESTYLE = "--"  # dashed
+LW        = 1.2
+ALPHA_T   = 0.95  # truth alpha
+ALPHA_S   = 0.6   # spoof alpha
+
+# Output files
+OUT_OVERLAY = "swarm_google_satellite_overlay.png"
+OUT_ENU     = "tracks_equal_scale_ENU.png"
+OUT_ZOOM    = "tracks_zoom_endpoint.png"
+OUT_CSV     = "swarm_tracks.csv"
+
+# =========================
+# 2) GEO HELPERS
+# =========================
+def dms_to_dd(dms_str: str) -> float:
+    s = dms_str.strip().replace(" ", "")
+    import re
+    m = re.match(r'(\d+)[°](\d+)[\']([\d\.]+)["]([NSEW])', s, re.IGNORECASE)
+    if not m:
+        raise ValueError(f"Bad DMS: {dms_str}")
+    deg = float(m.group(1)); mins = float(m.group(2)); secs = float(m.group(3))
+    hemi = m.group(4).upper()
+    dd = deg + mins/60.0 + secs/3600.0
+    if hemi in ["S","W"]:
+        dd = -dd
+    return dd
+
+def meters_per_deg(lat_deg: float) -> Tuple[float, float]:
+    lat_m_per_deg = 111_132.0
+    lon_m_per_deg = 111_320.0 * math.cos(math.radians(lat_deg))
+    return lat_m_per_deg, lon_m_per_deg
+
+def build_tracks(
+    launch: Tuple[float, float],
+    truth_target: Tuple[float, float],
+    spoof_target: Tuple[float, float],
+    n_drones: int,
+    n_steps: int,
+    spread_m: float
+):
+    """Return lists: truth_lons, truth_lats, spoof_lons, spoof_lats (each has n_drones arrays)."""
+    latA, lonA = launch
+    latT, lonT = truth_target
+    latS, lonS = spoof_target
+
+    truth_lat_base = np.linspace(latA, latT, n_steps)
+    truth_lon_base = np.linspace(lonA, lonT, n_steps)
+    spoof_lat_base = np.linspace(latA, latS, n_steps)
+    spoof_lon_base = np.linspace(lonA, lonS, n_steps)
+
+    lat_scale, _ = meters_per_deg(latA)
+    offsets = np.linspace(-spread_m/2, spread_m/2, n_drones)
+
+    truth_lats, truth_lons, spoof_lats, spoof_lons = [], [], [], []
+    for off in offsets:
+        truth_lats.append(truth_lat_base + off / lat_scale)
+        truth_lons.append(truth_lon_base.copy())
+        spoof_lats.append(spoof_lat_base + off / lat_scale)
+        spoof_lons.append(spoof_lon_base.copy())
+    return truth_lons, truth_lats, spoof_lons, spoof_lats
+
+# =========================
+# 3) GOOGLE WEB MERCATOR HELPERS
+# =========================
+TILE_SIZE = 256
+GOOGLE_STATIC_MAX = 640  # per side (size param) at scale 1 or 2
+
+def lonlat_to_pixel(lon: float, lat: float, zoom: int, tile_size: int = TILE_SIZE):
+    siny = max(min(math.sin(math.radians(lat)), 0.9999), -0.9999)
+    x = tile_size * (0.5 + lon/360.0) * (2**zoom)
+    y = tile_size * (0.5 - 0.5 * math.log((1 + siny) / (1 - siny)) / math.pi) * (2**zoom)
+    return x, y
+
+def fit_zoom_for_bounds(lon_min, lat_min, lon_max, lat_max, width_px, height_px, padding_px=60, max_zoom=20):
+    for z in range(max_zoom, -1, -1):
+        x_min, y_max = lonlat_to_pixel(lon_min, lat_min, z)
+        x_max, y_min = lonlat_to_pixel(lon_max, lat_max, z)
+        span_x = abs(x_max - x_min) + 2*padding_px
+        span_y = abs(y_max - y_min) + 2*padding_px
+        if span_x <= width_px and span_y <= height_px:
+            center_lon = (lon_min + lon_max)/2
+            center_lat = (lat_min + lat_max)/2
+            return z, center_lon, center_lat
+    return 0, (lon_min + lon_max)/2, (lat_min + lat_max)/2
+
+def fetch_google_static(center_lon, center_lat, zoom, size, maptype, api_key, scale=STATIC_SCALE):
+    # Request size must be <= 640 per side
+    req_w = min(GOOGLE_STATIC_MAX, max(1, size[0] // scale))
+    req_h = min(GOOGLE_STATIC_MAX, max(1, size[1] // scale))
+
+    params = {
+        "center": f"{center_lat},{center_lon}",
+        "zoom": str(zoom),
+        "size": f"{req_w}x{req_h}",
+        "scale": str(scale),
+        "maptype": maptype,
+        "key": api_key
+    }
+    url = "https://maps.googleapis.com/maps/api/staticmap?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(
+            f"Google Static Maps request failed (HTTP {e.code}). "
+            f"Check size limit (<=640) and API key/billing/restrictions.\n"
+            f"Params: {params}\nResponse (truncated): {body[:300]}"
+        ) from e
+
+    img = Image.open(io.BytesIO(data)).convert("RGBA")
+    if img.size != size:
+        img = img.resize(size, Image.LANCZOS)
+    return img
+
+# --- Per-drone dashed polylines (PIL) ---
+def rgba_from_tab10(i):
+    r,g,b,_ = cm.get_cmap("tab10")(i % 10)
+    return (int(r*255), int(g*255), int(b*255), 230)
+
+def draw_dashed_polyline(draw: ImageDraw.Draw, pts, dash_len=8, gap_len=6, width=3, color=(255,255,255,255)):
+    if len(pts) < 2: return
+    from math import hypot
+    for (x1,y1),(x2,y2) in zip(pts[:-1], pts[1:]):
+        dx, dy = x2-x1, y2-y1
+        seg_len = hypot(dx, dy)
+        if seg_len == 0: continue
+        ux, uy = dx/seg_len, dy/seg_len
+        dist, draw_dash = 0.0, True
+        while dist < seg_len:
+            d = min(dash_len if draw_dash else gap_len, seg_len - dist)
+            if draw_dash:
+                xa, ya = x1 + ux*dist, y1 + uy*dist
+                xb, yb = x1 + ux*(dist+d), y1 + uy*(dist+d)
+                draw.line([(xa,ya),(xb,yb)], fill=color, width=width)
+            dist += d
+            draw_dash = not draw_dash
+
+def draw_tracks_on_image(img, center_lon, center_lat, zoom,
+                         lon_tracks, lat_tracks, width=3):
+    """Draw per-drone dashed colored lines on the satellite image."""
+    W, H = img.size
+    cx, cy = lonlat_to_pixel(center_lon, center_lat, zoom)
+    draw = ImageDraw.Draw(img, "RGBA")
+    for idx, (lon, lat) in enumerate(zip(lon_tracks, lat_tracks)):
+        pts = []
+        for lo, la in zip(lon, lat):
+            px, py = lonlat_to_pixel(lo, la, zoom)
+            x = px - cx + W/2
+            y = py - cy + H/2
+            pts.append((x, y))
+        col = rgba_from_tab10(idx)  # unique color per drone
+        draw_dashed_polyline(draw, pts, dash_len=8, gap_len=6, width=width, color=col)
+
+def draw_label(img, lon, lat, text, center_lon, center_lat, zoom, fill=(255,255,255,230)):
+    W, H = img.size
+    cx, cy = lonlat_to_pixel(center_lon, center_lat, zoom)
+    px, py = lonlat_to_pixel(lon, lat, zoom)
+    x = px - cx + W/2
+    y = py - cy + H/2
+    d = ImageDraw.Draw(img, "RGBA")
+    r = 4
+    d.ellipse((x-r, y-r, x+r, y+r), fill=fill)
+    d.text((x+6, y-10), text, fill=fill)
+
+# =========================
+# 4) MATPLOTLIB PLOTS (per-drone dashed)
+# =========================
+def enu_preview_and_zoom(launch_lon, launch_lat,
+                         truth_lons, truth_lats,
+                         spoof_lons, spoof_lats,
+                         out_enu=OUT_ENU, out_zoom=OUT_ZOOM):
+    lat_scale, lon_scale = meters_per_deg(launch_lat)
+    def to_EN(lon, lat):
+        E = (lon - launch_lon) * lon_scale
+        N = (lat - launch_lat) * lat_scale
+        return E, N
+
+    colors = cm.get_cmap("tab10", len(truth_lons))  # 10 colors
+
+    # Equal-scale ENU
+    plt.figure(figsize=(9, 7))
+    for d in range(len(truth_lons)):
+        E_t, N_t = to_EN(truth_lons[d], truth_lats[d])
+        E_s, N_s = to_EN(spoof_lons[d], spoof_lats[d])
+        col = colors(d)
+        plt.plot(E_t, N_t, ls=LINESTYLE, lw=LW, color=col, alpha=ALPHA_T, label=f"D{d} truth")
+        plt.plot(E_s, N_s, ls=LINESTYLE, lw=LW, color=col, alpha=ALPHA_S, label=f"D{d} spoof")
+    plt.scatter([0], [0], marker="x", s=80, color="k")
+    plt.text(0, 0, "  Launch A")
+    plt.gca().set_aspect("equal", adjustable="datalim")
+    plt.xlabel("East (m)"); plt.ylabel("North (m)")
+    plt.title("Equal-scale ENU — 10 drones (dashed, per-drone colors)")
+    plt.grid(True, ls="--", alpha=0.3)
+    plt.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    plt.savefig(out_enu, dpi=150)
+    plt.close()
+
+    # Zoomed endpoint (last ~2 km) with arrows
+    Et, Nt = to_EN(truth_lons[0], truth_lats[0])
+    mask = (Et >= Et.max() - 2000)
+    plt.figure(figsize=(8, 6))
+    for d in range(len(truth_lons)):
+        E_t, N_t = to_EN(truth_lons[d], truth_lats[d])
+        E_s, N_s = to_EN(spoof_lons[d], spoof_lats[d])
+        col = colors(d)
+        plt.plot(E_t[mask], N_t[mask], ls=LINESTYLE, lw=LW+0.2, color=col, alpha=ALPHA_T)
+        plt.plot(E_s[mask], N_s[mask], ls=LINESTYLE, lw=LW+0.2, color=col, alpha=ALPHA_S)
+        # arrow from truth → spoof (endpoint)
+        plt.arrow(E_t[-1], N_t[-1], E_s[-1]-E_t[-1], N_s[-1]-N_t[-1],
+                  length_includes_head=True, head_width=5, head_length=10,
+                  alpha=0.8, color=col)
+    plt.gca().set_aspect("equal", adjustable="datalim")
+    plt.xlabel("East (m)"); plt.ylabel("North (m)")
+    plt.title("Zoom near endpoint — per-drone drift (dashed)")
+    plt.grid(True, ls="--", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_zoom, dpi=150)
+    plt.close()
+
+# =========================
+# 5) MAIN
+# =========================
+def main():
+    # Convert DMS
+    latA = dms_to_dd(LAUNCH_DMS[0]); lonA = dms_to_dd(LAUNCH_DMS[1])
+    latT = dms_to_dd(TRUTH_TARGET_DMS[0]); lonT = dms_to_dd(TRUTH_TARGET_DMS[1])
+    latS = dms_to_dd(DRIFT_TARGET_DMS[0]);  lonS = dms_to_dd(DRIFT_TARGET_DMS[1])
+
+    # Build tracks
+    truth_lons, truth_lats, spoof_lons, spoof_lats = build_tracks(
+        (latA, lonA), (latT, lonT), (latS, lonS),
+        n_drones=N_DRONES, n_steps=N_STEPS, spread_m=DRONE_SPREAD_M
+    )
+
+    # Bounds for map fit
+    all_lons = np.concatenate([*truth_lons, *spoof_lons])
+    all_lats = np.concatenate([*truth_lats, *spoof_lats])
+    lon_min, lon_max = float(all_lons.min()), float(all_lons.max())
+    lat_min, lat_max = float(all_lats.min()), float(all_lats.max())
+
+    # Fit zoom/center and fetch satellite tile
+    zoom, center_lon, center_lat = fit_zoom_for_bounds(
+        lon_min, lat_min, lon_max, lat_max, IMG_SIZE[0], IMG_SIZE[1], padding_px=60, max_zoom=20
+    )
+    img = fetch_google_static(center_lon, center_lat, zoom, IMG_SIZE, MAPTYPE, API_KEY, scale=STATIC_SCALE)
+
+    # Draw per-drone dashed tracks for Truth & Spoofed
+    draw_tracks_on_image(img, center_lon, center_lat, zoom, truth_lons, truth_lats, width=3)
+    draw_tracks_on_image(img, center_lon, center_lat, zoom, spoof_lons, spoof_lats, width=3)
+
+    # Label A, B_truth, B_spoof
+    draw_label(img, lonA, latA, "A (Launch)", center_lon, center_lat, zoom)
+    draw_label(img, lonT, latT, "B_truth",   center_lon, center_lat, zoom)
+    draw_label(img, lonS, latS, "B_spoof",   center_lon, center_lat, zoom)
+
+    img.save(OUT_OVERLAY)
+    print(f"Saved: {OUT_OVERLAY}")
+    print(f"Center: ({center_lat:.6f}, {center_lon:.6f})  Zoom: {zoom}")
+
+    # Matplotlib plots (equal-scale meters + zoomed)
+    enu_preview_and_zoom(lonA, latA, truth_lons, truth_lats, spoof_lons, spoof_lats,
+                         out_enu=OUT_ENU, out_zoom=OUT_ZOOM)
+    print(f"Saved: {OUT_ENU}")
+    print(f"Saved: {OUT_ZOOM}")
+
+    # CSV export
+    rows = []
+    for d in range(N_DRONES):
+        for i in range(N_STEPS):
+            rows.append({
+                "drone_id": d,
+                "truth_lat": float(truth_lats[d][i]),
+                "truth_lon": float(truth_lons[d][i]),
+                "spoof_lat": float(spoof_lats[d][i]),
+                "spoof_lon": float(spoof_lons[d][i]),
+            })
+    import csv
+    with open(OUT_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved: {OUT_CSV}")
+
+if __name__ == "__main__":
+    # Optional: ensure outputs next to the script
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    main()
